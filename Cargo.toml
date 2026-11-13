@@ -6,3 +6,4 @@ edition = "2024"
 [dependencies]
 sha2 = "0.10"
 texture2ddecoder = "=0.1.2"
+png = "0.17"

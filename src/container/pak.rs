@@ -135,7 +135,11 @@ pub fn calculate_subresource_footprint(
 ) -> (u32, u32) {
     let block_factor = if compressed { 4 } else { 1 };
     let w = if compressed { (width + 3) & !3 } else { width };
-    let h = if compressed { (height + 3) & !3 } else { height };
+    let h = if compressed {
+        (height + 3) & !3
+    } else {
+        height
+    };
 
     let bpp = format_mapping.block_dim.max(1);
 
@@ -227,8 +231,18 @@ pub struct MeshReport {
 #[derive(Debug, Clone, PartialEq)]
 pub struct DecodedMesh {
     pub vertices: Vec<[f32; 3]>,
+    pub normals: Vec<[f32; 3]>,
+    pub tangents: Vec<[f32; 4]>,
+    pub uv0: Vec<[f32; 2]>,
+    pub uv1: Vec<[f32; 2]>,
     pub indices: Vec<u16>,
+    pub skin: Option<MeshSkin>,
     pub report: MeshReport,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct MeshSkin {
+    pub influences: Vec<Vec<(u16, f32)>>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -339,7 +353,7 @@ impl TextureInventory {
             payloads += usize::from(entry.payload.is_some());
         }
         let mut output = format!(
-            "Texture inventory: {} VRAM_DESC resource(s), {} payload(s) located, PNG decoding unavailable because TLOU2 payload layout is unverified\n",
+            "Texture inventory: {} VRAM_DESC resource(s), {} payload(s) located, linear texture decoding available for export\n",
             self.descriptors.len(),
             payloads
         );
@@ -3025,7 +3039,7 @@ fn sha256_hex(bytes: &[u8]) -> String {
     digest.iter().map(|byte| format!("{byte:02x}")).collect()
 }
 
-fn read_texture_payload_bytes(payload: &TexturePayload) -> Result<Vec<u8>, PakError> {
+pub(crate) fn read_texture_payload_bytes(payload: &TexturePayload) -> Result<Vec<u8>, PakError> {
     let mut source = File::open(&payload.source_path).map_err(|source| PakError::Io {
         path: payload.source_path.clone(),
         operation: "open texture payload for analysis",
@@ -3419,7 +3433,7 @@ fn texture_payload_base(archive: &PakArchive) -> Result<u64, PakError> {
         .ok_or_else(|| invalid("texture payload base", last_page.offset, "overflow"))
 }
 
-fn texture_format(format_id: u32) -> (String, Option<u32>) {
+pub fn texture_format(format_id: u32) -> (String, Option<u32>) {
     match format_id {
         0x1c => ("R8G8B8A8_UNORM".to_owned(), Some(0)),
         0x1d => ("R8G8B8A8_UNORM_SRGB".to_owned(), Some(0)),
@@ -3518,16 +3532,35 @@ fn texture_status(descriptor: &TextureDescriptor, payload: Option<&TexturePayloa
             descriptor.format_name
         );
     }
-    if payload.is_none() {
+    let Some(payload) = payload else {
         return format!(
             "texture payload range is unresolved or outside the PAK: {}",
             descriptor.format_name
         );
+    };
+    let (source_format, _) = texture_format(payload.source_format_id);
+    let validation = if source_format == "BC1_UNORM" || source_format == "BC1_UNORM_SRGB" {
+        "linear BC1 decode validated"
+    } else {
+        "linear decode pending pixel validation"
+    };
+    if payload.source_format_id != descriptor.format_id
+        || payload.source_width != descriptor.width
+        || payload.source_height != descriptor.height
+        || payload.source_mip_count != descriptor.mip_count
+    {
+        return format!(
+            "dictionary payload {source_format} {}x{} mips={}; {validation}; actor descriptor {} {}x{} mips={}",
+            payload.source_width,
+            payload.source_height,
+            payload.source_mip_count,
+            descriptor.format_name,
+            descriptor.width,
+            descriptor.height,
+            descriptor.mip_count
+        );
     }
-    format!(
-        "raw payload located; PNG unsupported because TLOU2 payload layout is unverified ({})",
-        descriptor.format_name
-    )
+    format!("raw payload located; {validation} ({source_format})")
 }
 
 fn safe_filename_stem(path: &Path) -> String {
@@ -4082,17 +4115,22 @@ fn decode_geometry_mesh<R: Read + Seek>(
         .checked_mul(64)
         .ok_or_else(|| invalid("stream descriptor array", stream_address, "size overflow"))?;
     archive.page_for_range(stream_address, stream_bytes)?;
-    let descriptor = read_range(
+    let stream_table = read_range(
         source,
         file_size,
         stream_address,
-        64,
+        stream_bytes,
         &path.display().to_string(),
-        "read first vertex stream descriptor",
+        "read vertex stream descriptors",
     )?;
+    let stream_descriptors: Vec<&[u8]> = stream_table.chunks(64).collect();
+    let descriptor = stream_descriptors
+        .first()
+        .copied()
+        .ok_or_else(|| invalid("vertex stream descriptors", stream_address, "empty table"))?;
     let vertex_type = descriptor[20];
-    let descriptor_vertex_count = u32_at(&descriptor, 8, "stream vertex count")? as usize;
-    let vertex_buffer_size = u32_at(&descriptor, 16, "vertex buffer size")? as usize;
+    let descriptor_vertex_count = u32_at(descriptor, 8, "stream vertex count")? as usize;
+    let vertex_buffer_size = u32_at(descriptor, 16, "vertex buffer size")? as usize;
     let packed_stride = descriptor[22];
     let vertex_stride = usize::from(packed_stride >> 4);
     if vertex_type != 0 && vertex_type != 64 {
@@ -4130,7 +4168,7 @@ fn decode_geometry_mesh<R: Read + Seek>(
             ));
         }
     }
-    let vertex_pointer_raw = i64_at(&descriptor, 0, "vertex buffer pointer")?;
+    let vertex_pointer_raw = i64_at(descriptor, 0, "vertex buffer pointer")?;
     let vertex_buffer_offset = archive
         .resolve_pointer(stream_address, vertex_pointer_raw)?
         .ok_or_else(|| {
@@ -4163,16 +4201,16 @@ fn decode_geometry_mesh<R: Read + Seek>(
                 descriptor[27],
             ];
             let scale = [
-                f32_at(&descriptor, 32, "quantized X scale")?,
-                f32_at(&descriptor, 36, "quantized Y scale")?,
-                f32_at(&descriptor, 40, "quantized Z scale")?,
-                f32_at(&descriptor, 44, "quantized W scale")?,
+                f32_at(descriptor, 32, "quantized X scale")?,
+                f32_at(descriptor, 36, "quantized Y scale")?,
+                f32_at(descriptor, 40, "quantized Z scale")?,
+                f32_at(descriptor, 44, "quantized W scale")?,
             ];
             let offset = [
-                f32_at(&descriptor, 48, "quantized X offset")?,
-                f32_at(&descriptor, 52, "quantized Y offset")?,
-                f32_at(&descriptor, 56, "quantized Z offset")?,
-                f32_at(&descriptor, 60, "quantized W offset")?,
+                f32_at(descriptor, 48, "quantized X offset")?,
+                f32_at(descriptor, 52, "quantized Y offset")?,
+                f32_at(descriptor, 56, "quantized Z offset")?,
+                f32_at(descriptor, 60, "quantized W offset")?,
             ];
             let (vertices, bounds) = decode_quantized_positions(
                 &vertex_buffer,
@@ -4223,6 +4261,15 @@ fn decode_geometry_mesh<R: Read + Seek>(
         vertex_count,
         index_buffer_offset,
     )?;
+    let (normals, tangents, uv0, uv1) = decode_vertex_attributes(
+        archive,
+        source,
+        file_size,
+        path,
+        stream_address,
+        &stream_descriptors,
+        vertex_count,
+    )?;
     let material_raw = i64_at(&submesh, 72, "material pointer")?;
     let material_offset = archive
         .resolve_pointer(submesh_offset + 72, material_raw)?
@@ -4234,6 +4281,15 @@ fn decode_geometry_mesh<R: Read + Seek>(
             )
         })?;
     let textures = read_material_textures(archive, source, file_size, material_offset, path)?;
+    let skin = read_mesh_skin(
+        archive,
+        source,
+        file_size,
+        path,
+        submesh_offset,
+        &submesh,
+        vertex_count,
+    )?;
     let mut evidence = vec![
         "fmt_nd_pak.py identifies TLOU2 GEOMETRY_1 records as 48-byte resource-prefix followed by geometry fields; submesh records are 192 bytes.".to_owned(),
         "fmt_nd_pak.py reads TLOU2 stream descriptors at 64-byte intervals; type 0 with stride 12 is float3, and type 64 decodes bit widths from sizes[] then applies qScale * value + qOffs.".to_owned(),
@@ -4277,9 +4333,420 @@ fn decode_geometry_mesh<R: Read + Seek>(
     };
     Ok(DecodedMesh {
         vertices,
+        normals,
+        tangents,
+        uv0,
+        uv1,
         indices,
+        skin,
         report,
     })
+}
+
+fn read_mesh_skin<R: Read + Seek>(
+    archive: &PakArchive,
+    source: &mut R,
+    file_size: u64,
+    path: &Path,
+    submesh_offset: u64,
+    submesh: &[u8],
+    vertex_count: usize,
+) -> Result<Option<MeshSkin>, PakError> {
+    let skin_raw = i64_at(submesh, 88, "skin descriptor pointer")?;
+    if skin_raw == 0 {
+        return Ok(None);
+    }
+    let skin_field = submesh_offset + 88;
+    let skin_offset = archive
+        .resolve_pointer(skin_field, skin_raw)?
+        .ok_or_else(|| {
+            invalid(
+                "skin descriptor pointer",
+                skin_field,
+                "has no pointer fixup",
+            )
+        })?;
+    let skin_header = read_range(
+        source,
+        file_size,
+        skin_offset,
+        32,
+        &path.display().to_string(),
+        "read skin descriptor",
+    )?;
+    let _unknown0 = u32_at(&skin_header, 0, "skin unknown0")?;
+    let weight_count = u32_at(&skin_header, 4, "skin weight count")? as usize;
+    let _unknown2 = u32_at(&skin_header, 8, "skin unknown2")?;
+    let _unknown3 = u32_at(&skin_header, 12, "skin unknown3")?;
+    let map_raw = i64_at(&skin_header, 16, "skin index map pointer")?;
+    let map_offset = archive
+        .resolve_pointer(skin_offset + 16, map_raw)?
+        .ok_or_else(|| {
+            invalid(
+                "skin index map pointer",
+                skin_offset + 16,
+                "has no pointer fixup",
+            )
+        })?;
+    let weights_raw = i64_at(&skin_header, 24, "skin weights pointer")?;
+    let weights_offset = archive
+        .resolve_pointer(skin_offset + 24, weights_raw)?
+        .ok_or_else(|| {
+            invalid(
+                "skin weights pointer",
+                skin_offset + 24,
+                "has no pointer fixup",
+            )
+        })?;
+
+    let map_bytes = vertex_count
+        .checked_mul(8)
+        .ok_or_else(|| invalid("skin index map", map_offset, "size overflow"))?;
+    archive.page_for_range(map_offset, map_bytes)?;
+    let map = read_range(
+        source,
+        file_size,
+        map_offset,
+        map_bytes,
+        &path.display().to_string(),
+        "read skin index map",
+    )?;
+    let mut entries = Vec::with_capacity(vertex_count);
+    let mut max_weight_end = 0usize;
+    for entry in map.as_chunks::<8>().0 {
+        let count = u32::from_le_bytes(entry[0..4].try_into().expect("four bytes")) as usize;
+        let offset = u32::from_le_bytes(entry[4..8].try_into().expect("four bytes")) as usize;
+        let used = count.min(12);
+        let end = offset
+            .checked_add(used.checked_mul(4).unwrap_or(0))
+            .ok_or_else(|| invalid("skin weight entry", weights_offset, "offset overflow"))?;
+        max_weight_end = max_weight_end.max(end);
+        entries.push((used, offset));
+    }
+    if max_weight_end == 0 && weight_count > 0 {
+        return Err(invalid(
+            "skin weights",
+            weights_offset,
+            "weight table is empty but skin reports weights",
+        ));
+    }
+    let weight_bytes = read_range(
+        source,
+        file_size,
+        weights_offset,
+        max_weight_end,
+        &path.display().to_string(),
+        "read skin weights",
+    )?;
+    let mut influences = Vec::with_capacity(vertex_count);
+    for (count, offset) in entries {
+        let mut vertex = Vec::with_capacity(count);
+        for index in 0..count {
+            let word_offset = offset + index * 4;
+            let word = u32::from_le_bytes(
+                weight_bytes[word_offset..word_offset + 4]
+                    .try_into()
+                    .expect("four bytes"),
+            );
+            let bone = (word >> 22) as u16;
+            let raw_weight = word & 0x003f_ffff;
+            if raw_weight == 0 {
+                continue;
+            }
+            vertex.push((bone, raw_weight as f32 / 4_194_303.0));
+        }
+        vertex.sort_by(|left, right| right.1.total_cmp(&left.1));
+        let sum = vertex.iter().map(|(_, weight)| *weight).sum::<f32>();
+        if sum > 0.0 {
+            for (_, weight) in &mut vertex {
+                *weight /= sum;
+            }
+        }
+        influences.push(vertex);
+    }
+    archive.page_for_range(weights_offset, max_weight_end)?;
+    Ok(Some(MeshSkin { influences }))
+}
+
+type VertexAttributes = (Vec<[f32; 3]>, Vec<[f32; 4]>, Vec<[f32; 2]>, Vec<[f32; 2]>);
+
+fn decode_vertex_attributes<R: Read + Seek>(
+    archive: &PakArchive,
+    source: &mut R,
+    file_size: u64,
+    path: &Path,
+    stream_address: u64,
+    stream_descriptors: &[&[u8]],
+    vertex_count: usize,
+) -> Result<VertexAttributes, PakError> {
+    let mut normals = Vec::new();
+    let mut tangents = Vec::new();
+    let mut uv0 = Vec::new();
+    let mut uv1 = Vec::new();
+    for (index, descriptor) in stream_descriptors.iter().enumerate().skip(1) {
+        let kind = descriptor[20];
+        if !matches!(kind, 1 | 2 | 3 | 11 | 65 | 75 | 76) {
+            continue;
+        }
+        if matches!(kind, 65 | 75 | 76) && descriptor[24] == 0 && descriptor[25] == 0 {
+            continue;
+        }
+        let descriptor_offset = stream_address + (index as u64) * 64;
+        let count = u32_at(descriptor, 8, "attribute vertex count")? as usize;
+        if count != vertex_count {
+            return Err(invalid(
+                "attribute vertex count",
+                descriptor_offset + 8,
+                format!("stream {index} says {count}, expected {vertex_count}"),
+            ));
+        }
+        let buffer_size = u32_at(descriptor, 16, "attribute buffer size")? as usize;
+        let stride = usize::from(descriptor[22] >> 4);
+        if !matches!(kind, 65 | 75 | 76)
+            && (stride < 4 || buffer_size != count.saturating_mul(stride))
+        {
+            return Err(invalid(
+                "attribute buffer size",
+                descriptor_offset + 16,
+                format!(
+                    "stream {index} type {kind} has {buffer_size} bytes for {count} vertices at stride {stride}"
+                ),
+            ));
+        }
+        let pointer_raw = i64_at(descriptor, 0, "attribute buffer pointer")?;
+        let Some(buffer_offset) = archive.resolve_pointer(descriptor_offset, pointer_raw)? else {
+            continue;
+        };
+        archive.page_for_range(buffer_offset, buffer_size)?;
+        let buffer = read_range(
+            source,
+            file_size,
+            buffer_offset,
+            buffer_size,
+            &path.display().to_string(),
+            "read vertex attribute buffer",
+        )?;
+        match kind {
+            1 => {
+                if uv0.is_empty() {
+                    uv0 = decode_half2_attribute(&buffer, count, stride, buffer_offset, "UV0")?;
+                }
+            }
+            11 => {
+                if uv1.is_empty() {
+                    uv1 = decode_half2_attribute(&buffer, count, stride, buffer_offset, "UV1")?;
+                }
+            }
+            75 | 76 => {
+                if uv1.is_empty() {
+                    uv1 = decode_bitpacked_vec2_attribute(
+                        &buffer,
+                        count,
+                        &descriptor[24..28],
+                        &descriptor[32..48],
+                        &descriptor[48..64],
+                        buffer_offset,
+                        "UV1",
+                    )?;
+                }
+            }
+            2 => {
+                if normals.is_empty() {
+                    normals = decode_byte4_attribute(&buffer, count, stride, buffer_offset)?
+                        .into_iter()
+                        .map(|value| [value[0], value[1], value[2]])
+                        .collect();
+                }
+            }
+            3 => {
+                if tangents.is_empty() {
+                    tangents = decode_byte4_attribute(&buffer, count, stride, buffer_offset)?
+                        .into_iter()
+                        .map(|value| [value[0], value[1], value[2], value[3]])
+                        .collect();
+                }
+            }
+            65 if uv0.is_empty() => {
+                uv0 = decode_bitpacked_vec2_attribute(
+                    &buffer,
+                    count,
+                    &descriptor[24..28],
+                    &descriptor[32..48],
+                    &descriptor[48..64],
+                    buffer_offset,
+                    "UV0",
+                )?;
+            }
+            _ => {}
+        }
+    }
+    Ok((normals, tangents, uv0, uv1))
+}
+
+fn decode_bitpacked_vec2_attribute(
+    bytes: &[u8],
+    vertex_count: usize,
+    bit_widths: &[u8],
+    scale_bytes: &[u8],
+    offset_bytes: &[u8],
+    file_offset: u64,
+    label: &'static str,
+) -> Result<Vec<[f32; 2]>, PakError> {
+    let widths = [usize::from(bit_widths[0]), usize::from(bit_widths[1])];
+    if widths.contains(&0) || widths.iter().any(|width| *width > 32) {
+        return Err(invalid(
+            label,
+            file_offset,
+            format!("invalid bit widths {:?}", widths),
+        ));
+    }
+    let scale = [
+        f32::from_le_bytes(scale_bytes[0..4].try_into().unwrap()),
+        f32::from_le_bytes(scale_bytes[4..8].try_into().unwrap()),
+    ];
+    let offset = [
+        f32::from_le_bytes(offset_bytes[0..4].try_into().unwrap()),
+        f32::from_le_bytes(offset_bytes[4..8].try_into().unwrap()),
+    ];
+    if scale
+        .iter()
+        .chain(offset.iter())
+        .any(|value| !value.is_finite())
+    {
+        return Err(invalid(
+            label,
+            file_offset,
+            "non-finite quantization scale or offset",
+        ));
+    }
+    let bits_per_vertex = widths[0] + widths[1];
+    let expected_size = vertex_count
+        .checked_mul(bits_per_vertex)
+        .ok_or_else(|| invalid(label, file_offset, "size overflow"))?
+        .div_ceil(8);
+    if bytes.len() != expected_size {
+        return Err(invalid(
+            label,
+            file_offset,
+            format!(
+                "got {} bytes; {vertex_count} vertices at {bits_per_vertex} bits require {expected_size}",
+                bytes.len()
+            ),
+        ));
+    }
+
+    let mut bit_offset = 0usize;
+    let mut values = Vec::with_capacity(vertex_count);
+    for _ in 0..vertex_count {
+        let mut value = [0.0; 2];
+        for component in 0..2 {
+            let width = widths[component];
+            let mut quantized = 0u32;
+            for bit_index in 0..width {
+                let source_bit = bit_offset + bit_index;
+                let bit = (bytes[source_bit / 8] >> (source_bit % 8)) & 1;
+                quantized |= u32::from(bit) << bit_index;
+            }
+            bit_offset += width;
+            value[component] = quantized as f32 * scale[component] + offset[component];
+        }
+        values.push(value);
+    }
+    Ok(values)
+}
+
+fn decode_half2_attribute(
+    bytes: &[u8],
+    vertex_count: usize,
+    stride: usize,
+    file_offset: u64,
+    label: &'static str,
+) -> Result<Vec<[f32; 2]>, PakError> {
+    if stride < 4 {
+        return Err(invalid(
+            label,
+            file_offset,
+            format!("half2 attribute stride {stride} is smaller than 4"),
+        ));
+    }
+    let required = vertex_count
+        .checked_mul(stride)
+        .ok_or_else(|| invalid(label, file_offset, "size overflow"))?;
+    if bytes.len() < required {
+        return Err(invalid(
+            label,
+            file_offset,
+            format!("need {required} bytes, got {}", bytes.len()),
+        ));
+    }
+    let mut values = Vec::with_capacity(vertex_count);
+    for vertex in 0..vertex_count {
+        let offset = vertex * stride;
+        let u = half_to_f32(u16::from_le_bytes([bytes[offset], bytes[offset + 1]]));
+        let v = half_to_f32(u16::from_le_bytes([bytes[offset + 2], bytes[offset + 3]]));
+        values.push([u, v]);
+    }
+    Ok(values)
+}
+
+fn decode_byte4_attribute(
+    bytes: &[u8],
+    vertex_count: usize,
+    stride: usize,
+    file_offset: u64,
+) -> Result<Vec<[f32; 4]>, PakError> {
+    if stride < 4 {
+        return Err(invalid(
+            "byte4 attribute",
+            file_offset,
+            format!("stride {stride} is smaller than 4"),
+        ));
+    }
+    let required = vertex_count
+        .checked_mul(stride)
+        .ok_or_else(|| invalid("byte4 attribute", file_offset, "size overflow"))?;
+    if bytes.len() < required {
+        return Err(invalid(
+            "byte4 attribute",
+            file_offset,
+            format!("need {required} bytes, got {}", bytes.len()),
+        ));
+    }
+    let mut values = Vec::with_capacity(vertex_count);
+    for vertex in 0..vertex_count {
+        let offset = vertex * stride;
+        values.push([
+            f32::from(bytes[offset] as i8) / 127.0,
+            f32::from(bytes[offset + 1] as i8) / 127.0,
+            f32::from(bytes[offset + 2] as i8) / 127.0,
+            f32::from(bytes[offset + 3] as i8) / 127.0,
+        ]);
+    }
+    Ok(values)
+}
+
+fn half_to_f32(bits: u16) -> f32 {
+    let sign = u32::from(bits & 0x8000) << 16;
+    let exponent = u32::from(bits & 0x7c00) >> 10;
+    let mantissa = u32::from(bits & 0x03ff);
+    let value = if exponent == 0 {
+        if mantissa == 0 {
+            sign
+        } else {
+            let mut mantissa = mantissa;
+            let mut exponent = 127 - 15 + 1;
+            while mantissa & 0x0400 == 0 {
+                mantissa <<= 1;
+                exponent -= 1;
+            }
+            sign | (exponent << 23) | ((mantissa & 0x03ff) << 13)
+        }
+    } else if exponent == 0x1f {
+        sign | 0x7f80_0000 | (mantissa << 13)
+    } else {
+        sign | ((exponent + (127 - 15)) << 23) | (mantissa << 13)
+    };
+    f32::from_bits(value)
 }
 
 fn decode_float3_positions(
@@ -5184,7 +5651,12 @@ mod tests {
     fn test_mesh(name: &str, vertices: Vec<[f32; 3]>, indices: Vec<u16>) -> DecodedMesh {
         DecodedMesh {
             vertices,
+            normals: Vec::new(),
+            tangents: Vec::new(),
+            uv0: Vec::new(),
+            uv1: Vec::new(),
             indices,
+            skin: None,
             report: MeshReport {
                 pak_path: PathBuf::new(),
                 geometry_resource_offset: 0,
@@ -5480,7 +5952,12 @@ mod tests {
     fn obj_export_does_not_replace_output_when_validation_fails() {
         let mesh = DecodedMesh {
             vertices: vec![[0.0, 0.0, 0.0]],
+            normals: Vec::new(),
+            tangents: Vec::new(),
+            uv0: Vec::new(),
+            uv1: Vec::new(),
             indices: vec![0, 0, 1],
+            skin: None,
             report: MeshReport {
                 pak_path: PathBuf::new(),
                 geometry_resource_offset: 0,

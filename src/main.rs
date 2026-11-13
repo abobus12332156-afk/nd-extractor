@@ -1,4 +1,5 @@
-use std::path::Path;
+use std::fs;
+use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
 use nd_extractor::container::dsar::{DsarMetadataStats, DsarTableEntry};
@@ -6,7 +7,7 @@ use nd_extractor::container::pak::PakArchive;
 use nd_extractor::container::psarc::{
     PsarcSummary, inspect_path_with_limit, inspect_path_with_metadata_stats,
 };
-use nd_extractor::glb::export_geometry_glb;
+use nd_extractor::glb::{export_comprehensive_glb, export_comprehensive_glb_multi};
 
 const DEFAULT_ENTRY_LIMIT: usize = 20;
 
@@ -90,7 +91,8 @@ fn print_usage(program: &std::ffi::OsStr) {
          {} inspect-pak <file.pak>\n  {} extract-pak <file.pak> --output <directory>\n  \
          {} inspect-mesh <file.pak> [--all] [--output <report.txt>]\n  \
          {} export-mesh <file.pak> [--all] --output <mesh.obj>\n  \
-         {} export-glb <file.pak> --output <mesh.glb>\n  \
+         {} export-glb <file.pak|directory>... --output <mesh.glb> [--merge] [--skeleton <skel.pak>] [--dictionary <dict.pak>]\n  \
+         export-glb auto-detects <part>-skel.pak beside each PAK, then falls back to ellie-skel.pak; --skeleton overrides both\n  \
          {} inspect-textures <file.pak> [--all] [--dictionary <dict.pak>]\n  \
          {} inspect-texture-graphs <file.pak>\n  \
          {} inspect-dictionary-records <file.pak>\n  \
@@ -443,14 +445,35 @@ fn inspect_textures(program: &std::ffi::OsStr, arguments: &[std::ffi::OsString])
             } else {
                 print!("{}", inventory.summary());
                 if let Some(first) = inventory.descriptors.first() {
+                    let (format, width, height, mip_count) = first.payload.as_ref().map_or_else(
+                        || {
+                            (
+                                first.descriptor.format_name.clone(),
+                                first.descriptor.width,
+                                first.descriptor.height,
+                                first.descriptor.mip_count,
+                            )
+                        },
+                        |payload| {
+                            (
+                                nd_extractor::container::pak::texture_format(
+                                    payload.source_format_id,
+                                )
+                                .0,
+                                payload.source_width,
+                                payload.source_height,
+                                payload.source_mip_count,
+                            )
+                        },
+                    );
                     println!(
                         "Example: resource={} hash={:#018x} {} {}x{} mips={} payload={} status={}",
                         first.descriptor.resource_index,
                         first.descriptor.hash,
-                        first.descriptor.format_name,
-                        first.descriptor.width,
-                        first.descriptor.height,
-                        first.descriptor.mip_count,
+                        format,
+                        width,
+                        height,
+                        mip_count,
                         first.payload.as_ref().map_or_else(
                             || "unresolved".to_owned(),
                             |payload| format!(
@@ -516,7 +539,7 @@ fn extract_textures(program: &std::ffi::OsStr, arguments: &[std::ffi::OsString])
                     .filter(|entry| entry.payload.is_none())
                     .count();
                 println!(
-                    "Extracted {extracted}/{} raw GPU payloads to {}; PNG decoding is unsupported because the payload layout is unverified; {} unresolved",
+                    "Extracted {extracted}/{} raw GPU payloads to {}; use export-glb for decoded PNGs; {} unresolved",
                     inventory.descriptors.len(),
                     output.display(),
                     unresolved
@@ -751,49 +774,130 @@ fn export_glb(program: &std::ffi::OsStr, arguments: &[std::ffi::OsString]) -> Ex
         print_usage(program);
         return ExitCode::from(2);
     }
-    let source = Path::new(&arguments[0]);
+    let mut sources: Vec<PathBuf> = Vec::new();
     let mut output = None;
-    let mut index = 1;
+    let mut skeleton = None;
+    let mut dictionary = None;
+    let mut merge = false;
+    let mut index = 0;
     while index < arguments.len() {
-        if (arguments[index] == "--output" || arguments[index] == "-o") && output.is_none() {
+        if arguments[index] == "--output" || arguments[index] == "-o" {
             let Some(path) = arguments.get(index + 1) else {
                 eprintln!("error: export-glb requires a path after --output/-o");
                 return ExitCode::from(2);
             };
-            output = Some(Path::new(path).to_owned());
+            output = Some(PathBuf::from(path));
             index += 2;
-        } else {
+        } else if arguments[index] == "--skeleton" {
+            let Some(path) = arguments.get(index + 1) else {
+                eprintln!("error: export-glb requires a path after --skeleton");
+                return ExitCode::from(2);
+            };
+            skeleton = Some(PathBuf::from(path));
+            index += 2;
+        } else if arguments[index] == "--dictionary" {
+            let Some(path) = arguments.get(index + 1) else {
+                eprintln!("error: export-glb requires a path after --dictionary");
+                return ExitCode::from(2);
+            };
+            dictionary = Some(PathBuf::from(path));
+            index += 2;
+        } else if arguments[index] == "--merge" {
+            merge = true;
+            index += 1;
+        } else if arguments[index].to_string_lossy().starts_with('-') {
             print_usage(program);
             return ExitCode::from(2);
+        } else {
+            sources.push(PathBuf::from(&arguments[index]));
+            index += 1;
         }
     }
     let Some(output) = output else {
         eprintln!("error: export-glb requires --output <mesh.glb>");
         return ExitCode::from(2);
     };
-    match PakArchive::inspect_geometry_path(source) {
-        Ok(inventory) => match export_geometry_glb(&inventory, &output) {
-            Ok(summary) => {
-                println!(
-                    "Exported {} LOD0 static submeshes: {} vertices, {} triangles -> {}",
-                    summary.mesh_count,
-                    summary.vertex_count,
-                    summary.triangle_count,
-                    output.display()
-                );
-                println!(
-                    "Normals, UVs, texture images, and skinning were not exported; materials are placeholders."
-                );
-                ExitCode::SUCCESS
+    if sources.is_empty() {
+        eprintln!("error: export-glb requires at least one PAK or directory");
+        return ExitCode::from(2);
+    }
+    if !merge && sources.len() > 1 {
+        eprintln!("error: export-glb accepts multiple inputs only with --merge");
+        return ExitCode::from(2);
+    }
+
+    let result = if merge {
+        let sources = match expand_glb_sources(&sources) {
+            Ok(sources) => sources,
+            Err(message) => {
+                eprintln!("error: {message}");
+                return ExitCode::from(2);
             }
-            Err(error) => {
-                eprintln!("error: {error}");
-                ExitCode::FAILURE
-            }
-        },
+        };
+        export_comprehensive_glb_multi(
+            &sources,
+            skeleton.as_deref(),
+            dictionary.as_deref(),
+            &output,
+        )
+    } else {
+        match PakArchive::inspect_geometry_path(&sources[0]) {
+            Ok(inventory) => export_comprehensive_glb(
+                &sources[0],
+                &inventory,
+                skeleton.as_ref(),
+                dictionary.as_ref(),
+                &output,
+            ),
+            Err(error) => Err(error),
+        }
+    };
+
+    match result {
+        Ok(summary) => {
+            println!(
+                "Exported {} LOD0 comprehensive submeshes (geometry + textures): {} vertices, {} triangles -> {}",
+                summary.mesh_count,
+                summary.vertex_count,
+                summary.triangle_count,
+                output.display()
+            );
+            ExitCode::SUCCESS
+        }
         Err(error) => {
             eprintln!("error: {error}");
             ExitCode::FAILURE
         }
     }
+}
+
+fn expand_glb_sources(sources: &[PathBuf]) -> Result<Vec<PathBuf>, String> {
+    let mut expanded = Vec::new();
+    for source in sources {
+        if !source.is_dir() {
+            expanded.push(source.clone());
+            continue;
+        }
+        let mut entries: Vec<PathBuf> = fs::read_dir(source)
+            .map_err(|error| format!("cannot read {}: {error}", source.display()))?
+            .filter_map(|entry| entry.ok().map(|entry| entry.path()))
+            .filter(|path| {
+                path.extension()
+                    .is_some_and(|extension| extension.eq_ignore_ascii_case("pak"))
+            })
+            .filter(|path| {
+                !path.file_name().is_some_and(|name| {
+                    name.to_string_lossy()
+                        .to_ascii_lowercase()
+                        .ends_with("-skel.pak")
+                })
+            })
+            .collect();
+        entries.sort();
+        if entries.is_empty() {
+            return Err(format!("no PAK files found in {}", source.display()));
+        }
+        expanded.extend(entries);
+    }
+    Ok(expanded)
 }
